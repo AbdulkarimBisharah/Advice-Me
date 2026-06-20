@@ -26,6 +26,9 @@ env/
 # Extracted data directories
 extracted_*/
 
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+
 # IDE
 .vscode/
 .idea/
