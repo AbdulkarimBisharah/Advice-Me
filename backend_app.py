@@ -9,6 +9,7 @@ import joblib
 import logging
 import numpy as np
 import pandas as pd
+import shap
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -27,18 +28,27 @@ log = logging.getLogger("copilot-api")
 # ---------------------------------------------------------------------------
 BASE = pathlib.Path(__file__).parent
 
-_churn_model = None
-_churn_columns = None
+# Churn — LightGBM model from Colab + matching preprocessors
+_churn_model    = None   # LightGBM classifier
+_churn_scaler   = None   # StandardScaler
+_churn_encoders = None   # dict[col] -> LabelEncoder
+_churn_columns  = None   # ordered feature list
+_churn_explainer = None  # shap.TreeExplainer
+
+# Complaint classifier
 _complaint_vec = None
 _complaint_clf = None
 
 
 def load_churn():
-    global _churn_model, _churn_columns
+    global _churn_model, _churn_scaler, _churn_encoders, _churn_columns, _churn_explainer
     if _churn_model is None:
-        _churn_model = joblib.load(BASE / "churn_model.pkl")
-        _churn_columns = joblib.load(BASE / "churn_columns.pkl")
-        log.info("Churn model loaded (%d features)", len(_churn_columns))
+        _churn_model    = joblib.load(BASE / "churn_model.joblib")
+        _churn_scaler   = joblib.load(BASE / "churn_preprocessor.joblib")
+        _churn_encoders = joblib.load(BASE / "churn_label_encoders.joblib")
+        _churn_columns  = joblib.load(BASE / "churn_feature_columns.joblib")
+        _churn_explainer = shap.TreeExplainer(_churn_model)
+        log.info("Churn model (LightGBM) loaded — %d features", len(_churn_columns))
 
 
 def load_complaint():
@@ -119,11 +129,12 @@ CHURN_DEFAULTS: Dict[str, Any] = {
 
 
 def _risk_band(prob: float) -> str:
-    if prob >= 0.65:
-        return "high"
-    if prob >= 0.35:
-        return "medium"
-    return "low"
+    # Thresholds match the Colab notebook (risk_band function in cell 2)
+    if prob >= 0.70:
+        return "High"
+    if prob >= 0.40:
+        return "Medium"
+    return "Low"
 
 
 def _age_band(age: int) -> str:
@@ -154,12 +165,18 @@ def _heuristic_churn(p: "RiskInput") -> float:
 
 
 def _build_churn_row(payload: "RiskInput") -> pd.DataFrame:
+    """Build and preprocess one row exactly as the Colab notebook does:
+    1. Fill defaults for missing fields
+    2. Apply LabelEncoder per categorical column
+    3. Apply StandardScaler
+    """
     row = dict(CHURN_DEFAULTS)
+
+    # Map API fields onto training columns
     if payload.age is not None:
         row["age"] = payload.age
         row["age_band"] = _age_band(payload.age)
     if payload.monthly_income is not None:
-        # rough proxy: annual premium ≈ 12% of monthly income
         row["current_premium"] = payload.monthly_income * 0.12
         row["premium_last_year"] = row["current_premium"]
     if payload.complaint_flag is not None:
@@ -178,13 +195,34 @@ def _build_churn_row(payload: "RiskInput") -> pd.DataFrame:
     if payload.customer_tenure_months is not None:
         row["customer_tenure_months"] = payload.customer_tenure_months
     if payload.days_since_contact is not None:
-        # map silence to days_since_last_claim as a proxy for engagement recency
         row["days_since_last_claim"] = payload.days_since_contact
     if payload.extra:
         for k, v in payload.extra.items():
             if k in _churn_columns:
                 row[k] = v
-    return pd.DataFrame([row])[_churn_columns]
+
+    df = pd.DataFrame([row])
+
+    # Step 1: LabelEncode categoricals (mirror Colab cell 2)
+    for col, le in _churn_encoders.items():
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+            known = set(le.classes_)
+            df[col] = df[col].apply(lambda x: x if x in known else le.classes_[0])
+            df[col] = le.transform(df[col])
+
+    # Ensure correct column order; fill any missing with 0
+    for col in _churn_columns:
+        if col not in df.columns:
+            df[col] = 0
+    df = df[_churn_columns]
+
+    # Step 2: StandardScaler (mirror Colab cell 2)
+    df_scaled = pd.DataFrame(
+        _churn_scaler.transform(df),
+        columns=_churn_columns,
+    )
+    return df_scaled
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +259,23 @@ class RiskInput(BaseModel):
 class RiskOutput(BaseModel):
     churn_probability: float
     risk_band: str
+    top_risk_drivers: List[str] = Field(default_factory=list, description="Top 3 SHAP feature drivers")
+
+
+def _shap_drivers(df_scaled: pd.DataFrame) -> List[str]:
+    try:
+        shap_vals = _churn_explainer.shap_values(df_scaled)
+        # LightGBM binary returns list[ndarray] or single ndarray depending on version
+        sv = shap_vals[1] if isinstance(shap_vals, list) else shap_vals
+        return (
+            pd.Series(np.abs(sv[0]), index=_churn_columns)
+            .sort_values(ascending=False)
+            .head(3)
+            .index.tolist()
+        )
+    except Exception as exc:
+        log.warning("SHAP computation failed: %s", exc)
+        return []
 
 
 @app.post("/predict-risk", response_model=RiskOutput, tags=["ML"])
@@ -234,7 +289,8 @@ def predict_risk(payload: RiskInput):
     try:
         df = _build_churn_row(payload)
         prob = float(_churn_model.predict_proba(df)[0, 1])
-        return RiskOutput(churn_probability=round(prob, 4), risk_band=_risk_band(prob))
+        drivers = _shap_drivers(df)
+        return RiskOutput(churn_probability=round(prob, 4), risk_band=_risk_band(prob), top_risk_drivers=drivers)
     except Exception as exc:
         log.error("predict-risk model error: %s", exc)
         prob = _heuristic_churn(payload)
@@ -253,6 +309,7 @@ class BatchRiskOutput(BaseModel):
     client_id: str
     churn_probability: float
     risk_band: str
+    top_risk_drivers: List[str] = Field(default_factory=list)
 
 
 @app.post("/batch-risk", response_model=List[BatchRiskOutput], tags=["ML"])
@@ -262,27 +319,31 @@ def batch_risk(clients: List[BatchRiskItem]):
     if len(clients) > 200:
         raise HTTPException(status_code=400, detail="Max 200 clients per batch")
 
-    results = []
     churn_model_ok = True
     try:
         load_churn()
     except Exception:
         churn_model_ok = False
 
+    results = []
     for item in clients:
         try:
             if churn_model_ok:
                 df = _build_churn_row(item)
                 prob = float(_churn_model.predict_proba(df)[0, 1])
+                drivers = _shap_drivers(df)
             else:
                 prob = _heuristic_churn(item)
+                drivers = []
         except Exception as exc:
             log.error("batch-risk error for %s: %s", item.client_id, exc)
             prob = _heuristic_churn(item)
+            drivers = []
         results.append(BatchRiskOutput(
             client_id=item.client_id,
             churn_probability=round(prob, 4),
             risk_band=_risk_band(prob),
+            top_risk_drivers=drivers,
         ))
     return results
 
@@ -535,7 +596,7 @@ def parse_task(payload: ParseTaskInput):
 def health():
     return {
         "status": "ok",
-        "churn_model": "ready" if _churn_model is not None else "not loaded — run 01_churn_model_v2.py",
+        "churn_model": "ready (LightGBM + SHAP)" if _churn_model is not None else "not loaded — run generate_preprocessor.py and copy churn_model.joblib",
         "complaint_model": "ready" if _complaint_clf is not None else "not loaded — run 02_complaint_classifier.py",
         "anthropic_key": "set" if os.environ.get("ANTHROPIC_API_KEY") else "missing",
     }

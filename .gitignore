@@ -17,6 +17,7 @@ env/
 
 # Trained model artefacts (large binary files — regenerate with training scripts)
 *.pkl
+*.joblib
 
 # Data files (not committed — too large, sensitive)
 *.csv
